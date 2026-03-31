@@ -1,0 +1,1315 @@
+---
+title: "Market Risk Management:Multivariate GARCH Approaches"
+author: "Minh Duc Nguyen"
+date: "2025-12-22"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+is_html <- knitr::is_html_output()
+
+fmt_kable <- function(tbl, note = NULL) {
+  if (is_html) {
+    out <- tbl %>%
+      kableExtra::kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed", "bordered"),
+        full_width = FALSE, font_size = 11
+      )
+    if (!is.null(note)) {
+      out <- out %>% kableExtra::footnote(general = note, general_title = "Note: ")
+    }
+    out
+  } else {
+    tbl 
+  }
+}
+```
+
+# 0. Libraries
+
+```{r libraries}
+pkgs <- c(
+  "quantmod", "xts", "zoo", "foreign", "car", "carData",
+  "lmtest", "dynlm", "sandwich", "stargazer", "dplyr",
+  "systemfit", "caTools", "readxl", "AER", "stringr",
+  "mlogit", "nnet", "caret", "reshape2", "survival",
+  "forecast", "Metrics", "tseries", "tsutils", "ggplot2",
+  "urca", "rugarch", "Information", "FinTS", "TTR",
+  "vars", "rmgarch", "MTS", "broom", "quadprog",
+  "summarytools", "knitr", "kableExtra", "MCS", "scales", "tidyr"
+)
+invisible(lapply(pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}))
+```
+
+# 1. Data
+
+```{r data 1}
+# Tickers
+ticker_sp500 <- "SPY"    # S&P 500 ETF
+ticker_tb    <- "TLT"    # 20+ Year Treasury Bond ETF
+ticker_gold  <- "GLD"    # Gold ETF
+ticker_oil   <- "USO"    # Oil ETF
+
+#Date range
+date_start <- "2021-01-01"
+date_end   <- "2025-12-31"
+```
+
+
+```{r data 2}
+# Download closing prices
+get_close <- function(ticker, start, end) {
+  tryCatch({
+    x <- getSymbols(ticker, src = "yahoo",
+                    from = start, to = end,
+                    auto.assign = FALSE)
+    Ad(x)
+  }, error = function(e) {
+    stop(sprintf("Cannot download %s: %s", ticker, conditionMessage(e)))
+  })
+}
+
+raw_sp500 <- get_close(ticker_sp500, date_start, date_end)
+raw_tb    <- get_close(ticker_tb,    date_start, date_end)
+raw_gold  <- get_close(ticker_gold,  date_start, date_end)
+raw_oil   <- get_close(ticker_oil,   date_start, date_end)
+```
+
+
+```{r data 3}
+# Merge by date, keep only dates with no missing across all 4 variables
+prices <- merge(raw_sp500, raw_tb, raw_gold, raw_oil,
+                join = "inner")
+colnames(prices) <- c("sp500", "tb", "gold", "oil")
+
+prices <- na.omit(prices)
+
+cat(sprintf("Date range : %s to %s\n",
+            format(index(prices)[1]),
+            format(index(prices)[nrow(prices)])))
+cat(sprintf("Observations: %d days\n", nrow(prices)))
+cat(sprintf("Missing values: %d\n", sum(is.na(prices))))
+print(head(prices))
+
+# Extract vectors
+sp500 <- as.numeric(prices$sp500)
+tb    <- as.numeric(prices$tb)
+gold  <- as.numeric(prices$gold)
+oil   <- as.numeric(prices$oil)
+```
+
+# 2. Price series plots
+
+```{r plot_price}
+par(mfrow = c(2, 2))
+plot.ts(sp500, main = "S&P 500 ETF Price (USD)",              col = "steelblue", ylab = "Price (USD)")
+plot.ts(tb,    main = "10Y Treasury Bond ETF Price (USD)",    col = "steelblue", ylab = "Price (USD)")
+plot.ts(gold,  main = "Gold ETF Price (USD)",                 col = "steelblue", ylab = "Price (USD)")
+plot.ts(oil,   main = "Crude Oil ETF Price (USD)",            col = "steelblue", ylab = "Price (USD)")
+par(mfrow = c(1, 1))
+```
+
+# 3. Log-returns
+
+```{r log_return}
+r_gold  <- diff(log(gold))
+r_oil   <- diff(log(oil))
+r_tb    <- diff(log(tb))
+r_sp500 <- diff(log(sp500))
+
+returns <- cbind(r_sp500, r_tb, r_gold, r_oil)
+head(returns)
+```
+
+```{r plot_return}
+par(mfrow = c(2, 2))
+plot.ts(r_sp500, main = "r_sp500", ylab = "Log-Return", col = "steelblue")
+plot.ts(r_tb,    main = "r_tb",    ylab = "Log-Return", col = "steelblue")
+plot.ts(r_gold,  main = "r_gold",  ylab = "Log-Return", col = "steelblue")
+plot.ts(r_oil,   main = "r_oil",   ylab = "Log-Return", col = "steelblue")
+par(mfrow = c(1, 1))
+```
+
+# 3b. Risk-free rate — US T-bill 3-month (FRED: DTB3)
+
+```{r riskfree_rate}
+# Download DTB3 from FRED.
+rf_daily_series <- tryCatch({
+  getSymbols("DTB3", src = "FRED", auto.assign = FALSE)
+}, error = function(e) {
+  warning("Could not download DTB3 from FRED. Falling back to rf = 0. ",
+          conditionMessage(e))
+  NULL
+})
+
+if (!is.null(rf_daily_series)) {
+  # DTB3 in % per annum -> convert to daily decimal
+  rf_daily_series <- rf_daily_series / 100 / 252
+
+  # Build date index aligned to returns rows
+  if ("Date" %in% colnames(data)) {
+    ret_dates <- as.Date(data$Date[-1])          # diff() removes first row
+  } else {
+    # Synthetic trading-day calendar starting 2000-01-03
+    all_days <- seq(as.Date("2000-01-03"), by = "day",
+                    length.out = nrow(returns) * 3)
+    trading  <- all_days[!weekdays(all_days) %in% c("Saturday", "Sunday")]
+    ret_dates <- trading[1:nrow(returns)]
+  }
+
+  # For each return date, use the most recent T-bill rate on or before that date
+  # (strictly no-lookahead: rate at t-1 is used when deciding weights at t-1)
+  rf_vec <- sapply(ret_dates, function(d) {
+    idx <- which(index(rf_daily_series) <= d)
+    if (length(idx) == 0L) return(0)
+    as.numeric(rf_daily_series[max(idx)])
+  })
+  rf_vec[is.na(rf_vec)] <- 0
+
+  cat(sprintf("DTB3 loaded:  %d obs | %s to %s
+",
+              nrow(rf_daily_series),
+              format(min(index(rf_daily_series))),
+              format(max(index(rf_daily_series)))))
+  cat(sprintf("rf_vec:       %d obs aligned to returns
+", length(rf_vec)))
+  cat(sprintf("rf daily:     min=%.8f  max=%.8f  mean=%.8f
+",
+              min(rf_vec), max(rf_vec), mean(rf_vec)))
+  cat(sprintf("rf annualised: %.4f%%
+", mean(rf_vec) * 252 * 100))
+
+} else {
+  rf_vec <- rep(0, nrow(returns))
+  cat("rf = 0 (fallback — DTB3 unavailable).
+")
+}
+
+# Scalar summaries (no lookahead: each uses only data from the relevant window)
+rf_is_mean  <- mean(rf_vec[1:1461], na.rm = TRUE)
+rf_oos_mean <- mean(rf_vec[(nrow(returns) - 249):nrow(returns)], na.rm = TRUE)
+rf_daily    <- rf_is_mean    # scalar alias for in-sample use
+
+cat(sprintf("
+rf_is_mean  = %.8f / day  (%.4f%% ann)
+",
+            rf_is_mean,  rf_is_mean  * 252 * 100))
+cat(sprintf("rf_oos_mean = %.8f / day  (%.4f%% ann)
+",
+            rf_oos_mean, rf_oos_mean * 252 * 100))
+```
+
+# 4. Descriptive statistics
+
+```{r desc_stats}
+data_list <- list(r_sp500 = r_sp500, r_tb = r_tb, r_gold = r_gold, r_oil = r_oil)
+
+descr(returns, round.digits = 6)
+
+invisible(lapply(names(data_list), function(nm) {
+  r <- data_list[[nm]]
+  cat(sprintf("\n--- %s ---  Pos: %d | Neg: %d | Zero: %d\n",
+              nm, sum(r > 0), sum(r < 0), sum(r == 0)))
+}))
+```
+
+# 5. Histograms
+
+```{r histogram}
+par(mfrow = c(2, 2))
+for (nm in names(data_list)) {
+  r <- data_list[[nm]]
+  hist(r, main = paste("Histogram:", nm), col = "skyblue",
+       xlab = "Log-Return", prob = FALSE, breaks = 50)
+  curve(dnorm(x, mean(r, na.rm = TRUE), sd(r, na.rm = TRUE)),
+        add = TRUE, col = "red", lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+# 6. Normality test (Jarque-Bera test)
+
+```{r jb_test}
+invisible(lapply(names(data_list), function(nm) {
+  cat(sprintf("\n=== Jarque-Bera: %s ===\n", nm))
+  print(jarque.bera.test(data_list[[nm]]))
+}))
+```
+
+# 7. Unit root tests (ADF test)
+ADF test needed for time-series data to check stationarity. Non-stationary data can lead to spurious results in time-series analysis, so it's crucial to confirm that the log-return series are stationary before proceeding with modeling. The ADF test checks for the presence of a unit root, which indicates non-stationarity. We test with different specifications (trend, drift, none) to ensure robustness of the stationarity conclusion across various model assumptions.
+
+```{r adf_test}
+invisible(lapply(names(data_list), function(nm) {
+  cat(sprintf("\n========== ADF: %s ==========\n", nm))
+  for (type in c("trend", "drift", "none")) {
+    cat(sprintf("-- type = %s --\n", type))
+    print(summary(ur.df(data_list[[nm]], type = type, lags = 0)))
+  }
+}))
+```
+
+# 8. ACF / PACF
+
+```{r acf_pacf}
+invisible(lapply(names(data_list), function(nm) {
+  par(mfrow = c(1, 2))
+  acf(data_list[[nm]],  main = paste("ACF:", nm))
+  pacf(data_list[[nm]], main = paste("PACF:", nm))
+  par(mfrow = c(1, 1))
+}))
+```
+
+# 9. ARMA model selection (AIC)
+
+```{r arma}
+arma_sp500 <- auto.arima(r_sp500, ic = "aic")
+arma_tb    <- auto.arima(r_tb,    ic = "aic")
+arma_gold  <- auto.arima(r_gold,  ic = "aic")
+arma_oil   <- auto.arima(r_oil,   ic = "aic")
+invisible(lapply(list(arma_sp500, arma_tb, arma_gold, arma_oil), summary))
+```
+
+# 10. ARCH effect test (LM test)
+ARCH test needed for checking the presence of autoregressive conditional heteroskedasticity (ARCH) effects in the residuals of the fitted ARMA models. Detecting ARCH effects is crucial because it indicates that the variance of the errors is not constant over time, which violates the assumptions of standard linear regression models. If ARCH effects are present, it justifies the use of GARCH-type models that can capture time-varying volatility, leading to more accurate modeling and forecasting of financial returns.
+
+```{r arch_test}
+res_list <- list(
+  r_sp500 = arma_sp500$residuals, r_tb  = arma_tb$residuals,
+  r_gold  = arma_gold$residuals,  r_oil = arma_oil$residuals
+)
+invisible(lapply(names(res_list), function(nm) {
+  cat(sprintf("\n=== ARCH Test: %s ===\n", nm))
+  print(ArchTest(res_list[[nm]]^2, lags = 10))
+}))
+```
+
+# 11. Univariate GARCH models
+
+```{r univariate_garch}
+spec_sp500 <- ugarchspec(
+  mean.model     = arma_sp500$model,
+  variance.model = list(model = "eGARCH",   garchOrder = c(1, 1)),
+  distribution.model = "sstd")
+
+spec_tb <- ugarchspec(
+  mean.model     = arma_tb$model,
+  variance.model = list(model = "sGARCH",   garchOrder = c(1, 1)),
+  distribution.model = "std")
+
+spec_gold <- ugarchspec(
+  mean.model     = arma_gold$model,
+  variance.model = list(model = "sGARCH",   garchOrder = c(1, 1)),
+  distribution.model = "sged")
+
+spec_oil <- ugarchspec(
+  mean.model     = arma_oil$model,
+  variance.model = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+  distribution.model = "sstd")
+
+fit_sp500 <- ugarchfit(spec_sp500, data = r_sp500, solver = "hybrid")
+fit_tb    <- ugarchfit(spec_tb,    data = r_tb,    solver = "hybrid")
+fit_gold  <- ugarchfit(spec_gold,  data = r_gold,  solver = "hybrid")
+fit_oil   <- ugarchfit(spec_oil,   data = r_oil,   solver = "hybrid")
+
+show(fit_sp500); show(fit_tb); show(fit_gold); show(fit_oil)
+```
+
+# 12. Standardised residual diagnostics
+
+```{r garch_resid_test}
+resid_list <- list(
+  r_sp500 = residuals(fit_sp500, standardize = TRUE),
+  r_tb    = residuals(fit_tb,    standardize = TRUE),
+  r_gold  = residuals(fit_gold,  standardize = TRUE),
+  r_oil   = residuals(fit_oil,   standardize = TRUE)
+)
+invisible(lapply(names(resid_list), function(nm) {
+  r <- resid_list[[nm]]
+  cat(sprintf("\n=== %s ===\n", nm))
+  cat("Ljung-Box (resid):\n");   print(Box.test(r,   lag = 10, type = "Ljung-Box"))
+  cat("Ljung-Box (resid^2):\n"); print(Box.test(r^2, lag = 10, type = "Ljung-Box"))
+  cat("ARCH test:\n");           print(ArchTest(r^2))
+}))
+```
+
+# 13. DCC-GARCH
+
+```{r dcc_fit}
+spec_dcc <- dccspec(
+  uspec        = multispec(list(spec_sp500, spec_tb, spec_gold, spec_oil)),
+  dccOrder     = c(1, 1),
+  distribution = "mvt"
+)
+
+dcc_model <- dccfit(spec_dcc, data = returns, out.sample = 250)
+dcc_model
+print(DCCtest(residuals(dcc_model)))
+```
+
+# 14. Dynamic correlation & covariance plots
+
+```{r plot_functions}
+plot_dynamic_corr <- function(model, title_label) {
+  R_t         <- rcor(model)
+  T_in        <- dim(R_t)[3]
+  dates_in    <- if (!is.null(index(returns))) tail(index(returns), T_in) else 1:T_in
+  asset_names <- colnames(returns)
+  corr_list   <- list()
+  for (i in 1:(ncol(returns) - 1))
+    for (j in (i + 1):ncol(returns))
+      corr_list[[length(corr_list) + 1]] <- data.frame(
+        Date = dates_in, Corr = R_t[i, j, ],
+        Pair = paste(asset_names[i], "-", asset_names[j]))
+  ggplot(do.call(rbind, corr_list), aes(x = Date, y = Corr)) +
+    geom_line(color = "#1f77b4", linewidth = 0.8) +
+    facet_wrap(~ Pair, ncol = 2, scales = "free_y") +
+    labs(title = paste("Dynamic Correlation —", title_label),
+         x = "Date", y = "Conditional Correlation") +
+    theme_minimal(base_size = 13) +
+    theme(strip.text = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+plot_dynamic_cov <- function(model, title_label) {
+  H_t         <- rcov(model)
+  T_in        <- dim(H_t)[3]
+  dates_in    <- if (!is.null(index(returns))) tail(index(returns), T_in) else 1:T_in
+  asset_names <- colnames(returns)
+  cov_list    <- list()
+  for (i in 1:(ncol(returns) - 1))
+    for (j in (i + 1):ncol(returns))
+      cov_list[[length(cov_list) + 1]] <- data.frame(
+        Date = dates_in, Cov = H_t[i, j, ],
+        Pair = paste(asset_names[i], "-", asset_names[j]))
+  ggplot(do.call(rbind, cov_list), aes(x = Date, y = Cov)) +
+    geom_line(color = "#D62728", linewidth = 0.8) +
+    facet_wrap(~ Pair, ncol = 2, scales = "free_y") +
+    labs(title = paste("Conditional Covariance —", title_label),
+         x = "Date", y = "Conditional Covariance") +
+    theme_minimal(base_size = 13) +
+    theme(strip.text = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+```
+
+```{r dcc_plots}
+plot_dynamic_corr(dcc_model, "DCC-GARCH")
+plot_dynamic_cov(dcc_model,  "DCC-GARCH")
+```
+
+# 15. GO-GARCH
+
+```{r go_fit}
+set.seed(123)
+spec_go <- gogarchspec(
+  mean.model     = list(model = "constant", robust = FALSE),
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+  distribution.model = "magh",
+  ica = "fastica"
+)
+gogarch_model <- gogarchfit(spec = spec_go, data = returns, out.sample = 250)
+show(gogarch_model)
+gogarch_model@mfit$garchcoef
+```
+
+```{r go_plots}
+plot_dynamic_corr(gogarch_model, "GO-GARCH")
+plot_dynamic_cov(gogarch_model,  "GO-GARCH")
+```
+
+# 16. Forecast evaluation — variance & correlation
+
+```{r forecast_eval 1}
+n           <- nrow(returns)
+asset_names <- colnames(returns)
+
+# Realised variance: expanding window — uses only data up to day t (no lookahead)
+var_expand <- lapply(seq_along(asset_names), function(j) {
+  v <- rep(NA, n)
+  for (t in 2:n) v[t] <- var(returns[1:t, j], na.rm = TRUE)
+  v
+})
+names(var_expand) <- asset_names
+
+real_var   <- lapply(asset_names, function(nm) tail(var_expand[[nm]], 250))
+names(real_var) <- asset_names
+real_sigma <- lapply(asset_names, function(nm) sqrt(real_var[[nm]]))
+names(real_sigma) <- asset_names
+```
+
+
+```{r forecast_eval 2}
+dcc_forecast       <- dccforecast(dcc_model, n.ahead = 1, n.roll = 249)
+dcc_cov_forecast   <- rcov(dcc_forecast)
+dcc_cor_forecast   <- rcor(dcc_forecast)
+dcc_sigma_forecast <- sigma(dcc_forecast)
+dcc_mean_forecast  <- fitted(dcc_forecast)
+
+go_forecast       <- gogarchforecast(gogarch_model, n.ahead = 1, n.roll = 249)
+go_cov_forecast   <- rcov(go_forecast)
+go_cor_forecast   <- rcor(go_forecast)
+go_sigma_forecast <- sigma(go_forecast)
+go_mean_forecast  <- fitted(go_forecast)
+```
+
+
+```{r forecast_eval 3}
+# DCC forecasted variance
+n_days_dcc  <- dim(dcc_sigma_forecast)[3]
+dcc_var_mat <- matrix(NA, n_days_dcc, 4, dimnames = list(NULL, asset_names))
+for (t in 1:n_days_dcc) dcc_var_mat[t, ] <- dcc_sigma_forecast[1,, t]^2
+
+# GO forecasted variance
+n_days_go  <- length(go_cov_forecast)
+go_var_mat <- matrix(NA, n_days_go, 4, dimnames = list(NULL, asset_names))
+for (t in 1:n_days_go) go_var_mat[t, ] <- diag(go_cov_forecast[[t]][,, 1])
+```
+
+
+```{r forecast_eval 4}
+eval_df <- data.frame(
+  Asset         = asset_names,
+  DCC_MSE_Var   = sapply(asset_names, function(nm) mse(real_var[[nm]], dcc_var_mat[, nm])),
+  DCC_MAE_Var   = sapply(asset_names, function(nm) mae(real_var[[nm]], dcc_var_mat[, nm])),
+  DCC_MSE_Sigma = sapply(asset_names, function(nm) mse(real_sigma[[nm]], sqrt(dcc_var_mat[, nm]))),
+  DCC_MAE_Sigma = sapply(asset_names, function(nm) mae(real_sigma[[nm]], sqrt(dcc_var_mat[, nm]))),
+  GO_MSE_Var    = sapply(asset_names, function(nm) mse(real_var[[nm]], go_var_mat[, nm])),
+  GO_MAE_Var    = sapply(asset_names, function(nm) mae(real_var[[nm]], go_var_mat[, nm])),
+  GO_MSE_Sigma  = sapply(asset_names, function(nm) mse(real_sigma[[nm]], sqrt(go_var_mat[, nm]))),
+  GO_MAE_Sigma  = sapply(asset_names, function(nm) mae(real_sigma[[nm]], sqrt(go_var_mat[, nm])))
+)
+kable(eval_df, digits = 8, caption = "MSE/MAE: Forecasted Variance & Volatility") %>%
+  fmt_kable()
+```
+
+
+```{r forecast_eval 5}
+# Dynamic correlation evaluation
+cov_expand <- vector("list", n)
+for (t in 2:n) cov_expand[[t]] <- cov(returns[1:t, ], use = "pairwise.complete.obs")
+cor_expand     <- lapply(cov_expand, function(x) if (!is.null(x)) cov2cor(x) else NULL)
+pairs_list     <- combn(asset_names, 2, simplify = FALSE)
+cor_expand_oos <- cor_expand[(n - 249):n]
+
+real_cor_series <- lapply(pairs_list, function(pair)
+  sapply(cor_expand_oos, function(x) if (!is.null(x)) x[pair[1], pair[2]] else NA))
+dcc_cor_series  <- lapply(pairs_list, function(pair)
+  sapply(dcc_cor_forecast, function(x) x[pair[1], pair[2], 1]))
+go_cor_series   <- lapply(pairs_list, function(pair)
+  sapply(go_cor_forecast, function(x) x[pair[1], pair[2], 1]))
+```
+
+
+```{r forecast_eval 6}
+cor_eval <- data.frame(
+  Pair    = sapply(pairs_list, paste, collapse = "-"),
+  DCC_MAE = mapply(function(r, f) mean(abs(r - f), na.rm = TRUE), real_cor_series, dcc_cor_series),
+  DCC_MSE = mapply(function(r, f) mean((r - f)^2,  na.rm = TRUE), real_cor_series, dcc_cor_series),
+  GO_MAE  = mapply(function(r, f) mean(abs(r - f), na.rm = TRUE), real_cor_series, go_cor_series),
+  GO_MSE  = mapply(function(r, f) mean((r - f)^2,  na.rm = TRUE), real_cor_series, go_cor_series)
+)
+kable(cor_eval, digits = 8, caption = "MSE/MAE: Forecasted Dynamic Correlation") %>%
+  fmt_kable()
+```
+
+# 17. Core VaR / ES / Backtest functions
+
+```{r core_functions 1}
+# Fissler-Ziegel (2016) joint loss function for VaR & ES forecasts.
+FZ <- function(r, VaR, ES, alpha) {
+  I     <- as.numeric(r < VaR)
+  term1 <- (I - alpha) * (VaR - r)
+  term2 <- (1 / alpha) * I * (ES - r)
+  term1 + term2
+}
+
+# Parametric VaR & ES: Normal + Student-t
+compute_var_es_param <- function(mu_vec, sigma_vec, alpha, df_t = 5) {
+  z_n <- qnorm(alpha)
+  t_a <- qt(alpha, df = df_t)
+  list(
+    VaR_N = mu_vec + z_n * sigma_vec,
+    ES_N  = mu_vec - (dnorm(z_n) / alpha) * sigma_vec,
+    VaR_T = mu_vec + t_a * sigma_vec,
+    ES_T  = mu_vec - sigma_vec * ((df_t + t_a^2) / (df_t - 1)) * (dt(t_a, df_t) / alpha)
+  )
+}
+```
+
+
+```{r core_functions 2}
+# Dynamic Quantile (DQ) Test — Engle & Manganelli (2004)
+# Tests H0: hit sequence is uncorrelated with its own lags and VaR
+# hit = I(r_t < VaR_t) - alpha
+# Regress hit_t on const, hit_{t-1}, ..., hit_{t-p}, VaR_t
+dq_test <- function(actual, VaR, alpha, p = 4) {
+  T_    <- length(actual)
+  hit   <- as.numeric(actual < VaR) - alpha
+  # build regressor matrix (no lookahead: VaR is 1-step-ahead forecast)
+  if (T_ <= p + 1) return(list(stat = NA_real_, pval = NA_real_, df = NA_integer_))
+  Y  <- hit[(p + 1):T_]
+  X  <- cbind(1,
+              sapply(1:p, function(k) hit[(p + 1 - k):(T_ - k)]),
+              VaR[(p + 1):T_])
+  colnames(X) <- c("const", paste0("hit_lag", 1:p), "VaR")
+  tryCatch({
+    fit  <- lm(Y ~ X - 1)
+    n    <- length(Y)
+    k    <- ncol(X)
+    RSS  <- sum(residuals(fit)^2)
+    # Wald statistic: beta' (X'X)^{-1} beta / (RSS/n) * n
+    # Under H0 DQ ~ chi-sq(k)
+    b    <- coef(fit)
+    V    <- (RSS / n) * solve(t(X) %*% X)
+    stat <- as.numeric(t(b) %*% solve(V) %*% b)
+    pval <- pchisq(stat, df = k, lower.tail = FALSE)
+    list(stat = round(stat, 4), pval = round(pval, 4), df = k)
+  }, error = function(e) list(stat = NA_real_, pval = NA_real_, df = NA_integer_))
+}
+```
+
+
+```{r core_functions 3}
+# run_backtest: UC, CC (Christoffersen 1998), DQ, ES, FZ
+run_backtest <- function(actual, VaR, ES, alpha, model_label, dist_label) {
+  
+  # UC & CC (rugarch)
+  # VaRTest returns a flat list: $uc.LRp, $cc.LRp  (scalars)
+  uc_p <- NA_real_; cc_p <- NA_real_
+  tryCatch({
+    vt <- VaRTest(alpha, actual = actual, VaR = VaR, conf.level = 1 - alpha)
+    if (!is.null(vt[["uc.LRp"]]) && length(vt[["uc.LRp"]]) == 1L)
+      uc_p <- round(as.numeric(vt[["uc.LRp"]]), 4)
+    if (!is.null(vt[["cc.LRp"]]) && length(vt[["cc.LRp"]]) == 1L)
+      cc_p <- round(as.numeric(vt[["cc.LRp"]]), 4)
+  }, error = function(e) NULL, warning = function(w) NULL)
+
+  # ESTest 
+  es_p <- NA_real_
+  tryCatch({
+    et <- ESTest(alpha, actual = actual, VaR = VaR, ES = ES,
+                 conf.level = 1 - alpha, boot = FALSE)
+    if (!is.null(et[["p.value"]]) && length(et[["p.value"]]) >= 1L)
+      es_p <- round(as.numeric(et[["p.value"]][1]), 4)
+  }, error = function(e) NULL, warning = function(w) NULL)
+
+  # DQ test
+  dq    <- dq_test(actual, VaR, alpha)
+  dq_p  <- if (!is.null(dq$pval)) dq$pval else NA_real_
+
+  n_viol <- sum(actual < VaR, na.rm = TRUE)
+
+  data.frame(
+    Model       = model_label, Dist  = dist_label, Alpha = alpha,
+    Mean_VaR    = round(mean(VaR, na.rm = TRUE), 6),
+    Mean_ES     = round(mean(ES,  na.rm = TRUE), 6),
+    N_Violation = as.integer(n_viol),
+    Exc_Rate    = round(n_viol / length(actual), 4),
+    UC_pval     = uc_p,
+    CC_pval     = cc_p,
+    DQ_pval     = dq_p,
+    ES_pval     = es_p,
+    FZ_Score    = round(mean(FZ(actual, VaR, ES, alpha), na.rm = TRUE), 8),
+    stringsAsFactors = FALSE
+  )
+}
+
+backtest_multi_alpha <- function(actual, mu_vec, sigma_vec, alphas,
+                                  model_label, df_t = 5) {
+  do.call(rbind, lapply(alphas, function(a) {
+    res <- compute_var_es_param(mu_vec, sigma_vec, a, df_t)
+    rbind(
+      run_backtest(actual, res$VaR_N, res$ES_N, a, model_label, "Normal"),
+      run_backtest(actual, res$VaR_T, res$ES_T, a, model_label, "Student-t")
+    )
+  }))
+}
+```
+
+# 18. Optimized Portfolio
+This section introduces three core functions used in the portfolio optimization process for constructing the Tangency Portfolio, which maximizes the Sharpe ratio and represents the optimal trade-off between expected return and risk. Geometrically, the Tangency Portfolio is the point where the efficient frontier is tangent to the Capital Allocation Line (CAL) drawn from the risk-free rate.
+
+The compute_tangency_weights function calculates the portfolio weights that maximize the Sharpe ratio under a no short-selling constraint using quadratic programming. If no asset is expected to outperform the risk-free rate, the function automatically switches to the Minimum Variance Portfolio, ensuring that the optimizer always produces a valid solution.
+
+```{r tangency_functions 1}
+shrink_mean <- function(R_window) {
+  colMeans(R_window)
+}
+
+# Compute Tangency weights (no short-selling).
+# Fallback to MVP if all excess returns <= 0 or QP fails.
+compute_tangency_weights <- function(mu_vec, Sigma, rf = 0) {
+  N      <- length(mu_vec)
+  excess <- mu_vec - rf
+
+  mvp_solve <- function() {
+    w <- quadprog::solve.QP(
+      Dmat = 2 * Sigma + diag(1e-8, N),
+      dvec = rep(0, N),
+      Amat = cbind(rep(1, N), diag(N)),
+      bvec = c(1, rep(0, N)), meq = 1
+    )$solution
+    pmax(w, 0) / sum(pmax(w, 0))
+  }
+
+  if (all(excess <= 1e-10)) return(mvp_solve())
+
+  tryCatch({
+    sol   <- quadprog::solve.QP(
+      Dmat = 2 * Sigma + diag(1e-8, N),
+      dvec = rep(0, N),
+      Amat = cbind(excess, diag(N)),
+      bvec = c(1, rep(0, N)), meq = 1
+    )
+    w_raw <- pmax(sol$solution, 0)
+    if (sum(w_raw) < 1e-10) return(mvp_solve())
+    w_raw / sum(w_raw)
+  }, error = function(e) mvp_solve())
+}
+```
+
+The compute_tangency_rolling function updates portfolio weights daily in an out-of-sample framework, using only information available at the time. Expected returns and covariance matrices are taken from one-step-ahead forecasts (from DCC-GARCH or GO-GARCH), while the risk-free rate is the most recently observed T-bill rate. This strict timing ensures that the backtest remains free from lookahead bias.
+
+```{r tangency_functions 2}
+# Rolling Tangency weights from multivariate model forecasts.
+# STRICT no-lookahead: weight at step t uses ONLY
+#   - mu from mean_fc_arr[1,,t]  (1-step-ahead forecast made at t-1)
+#   - Sigma from cov_fc_list[[t]] (1-step-ahead forecast made at t-1)
+# rf_vec_oos: optional vector of daily rf rates aligned to OOS period (length = n_ahead).
+# If NULL, scalar rf_daily is used for all steps.
+compute_tangency_rolling <- function(mean_fc_arr, cov_fc_list,
+                                      rf_daily = 0, rf_vec_oos = NULL) {
+  n_ahead  <- length(cov_fc_list)
+  n_assets <- dim(cov_fc_list[[1]])[1]
+  W        <- matrix(NA, nrow = n_ahead, ncol = n_assets)
+  colnames(W) <- colnames(returns)
+
+  for (t in 1:n_ahead) {
+    mu_t    <- as.numeric(mean_fc_arr[1, , t])
+    Sigma_t <- cov_fc_list[[t]][,, 1]
+    # Use time-varying rf if provided (no lookahead: rf at t uses rate from t-1)
+    rf_t    <- if (!is.null(rf_vec_oos) && length(rf_vec_oos) >= t)
+                 rf_vec_oos[t] else rf_daily
+    if (is.na(rf_t)) rf_t <- rf_daily
+    W[t, ]  <- compute_tangency_weights(mu_t, Sigma_t, rf = rf_t)
+  }
+  W
+}
+```
+
+```{r var_parametric 1}
+T_total   <- nrow(returns)
+N         <- ncol(returns)
+window_in <- 1003
+n_out     <- 250
+start_out <- T_total - n_out + 1
+alphas <- c(0.01, 0.025, 0.05)
+df_t   <- 5
+
+# Storage
+W_tan      <- matrix(NA, nrow = n_out, ncol = N,
+                           dimnames = list(NULL, asset_names))
+sigma_para_roll <- numeric(n_out)
+mu_para_roll    <- numeric(n_out)
+r_p_para        <- numeric(n_out)
+
+for (t in 1:n_out) {
+  day_OOS   <- start_out + t - 1
+  idx_end   <- day_OOS - 1              # strictly before forecast day
+  idx_start <- idx_end - window_in + 1
+  R_window  <- returns[idx_start:idx_end, ]
+
+  #NO lookahead
+  mu_shrink        <- shrink_mean(R_window)
+  Sigma_t          <- cov(R_window)
+
+  # rf at this step: T-bill rate observed on day_OOS - 1 (no lookahead)
+  rf_t             <- rf_vec[idx_end]
+  if (is.na(rf_t)) rf_t <- rf_is_mean
+
+  # Tangency weights decided at t-1, applied to day t return
+  w_t              <- compute_tangency_weights(mu_shrink, Sigma_t, rf = rf_t)
+  W_tan[t, ]  <- w_t
+  mu_para_roll[t]   <- sum(w_t * mu_shrink)
+  sigma_para_roll[t] <- sqrt(t(w_t) %*% Sigma_t %*% w_t)
+  r_p_para[t]       <- as.numeric(w_t %*% returns[day_OOS, ])  # realised
+}
+```
+
+```{r dynamic portfolio area plot}
+library(tidyr)
+df <- as.data.frame(W_tan)
+df$date <- seq.Date(from = as.Date("2025-01-01"), by = "day", length.out = nrow(df))
+
+df_long <- pivot_longer(df,
+  cols = c(r_sp500, r_tb, r_gold, r_oil),
+  names_to  = "group",
+  values_to = "value"
+)
+
+ggplot(df_long, aes(x = date, y = value, fill = group)) +
+  geom_area(position = "stack", alpha = 0.85) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_date(date_labels = "%Y-%m") +
+  scale_fill_manual(
+    values = c(
+      "r_sp500" = "#90CAF9",
+      "r_tb"    = "#EF9A9A",
+      "r_gold"  = "#FFE082",
+      "r_oil"   = "#A5D6A7"
+    ),
+    labels = c(
+      "r_sp500" = "SPY",
+      "r_tb"    = "TLT",
+      "r_gold"  = "GLD",
+      "r_oil"   = "USO"
+    )
+  ) +
+  guides(fill = guide_legend(nrow = 1, override.aes = list(alpha = 1))) +
+  labs(x = NULL, y = NULL, fill = "Assets",
+       title = "Rolling Tangency Portfolio Weights (No Lookahead)") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, color = "#1a1a2e"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e0e0e0", linewidth = 0.3),
+    legend.position  = "bottom",
+    legend.direction = "horizontal",
+    legend.text      = element_text(size = 10, color = "#555555"),
+    legend.key.size  = unit(0.5, "cm"),
+    legend.spacing.x = unit(0.3, "cm"),
+    axis.text        = element_text(color = "#555555"),
+    plot.background  = element_rect(fill = "#f9f9f9", color = NA),
+    panel.background = element_rect(fill = "#f9f9f9", color = NA)
+  )
+```
+
+#19. Parametric VaR & ES backtest (alpha = 1%, 2.5%, 5%)
+
+```{r}
+para_results <- backtest_multi_alpha(r_p_para, mu_para_roll, sigma_para_roll,
+                                      alphas, "Parametric", df_t)
+
+kable(para_results, caption = "Parametric Backtest — multiple alpha levels") %>%
+  fmt_kable()
+```
+
+# 20. DCC-GARCH — VaR & ES (alpha = 1%, 2.5%, 5%)
+
+```{r var_dcc 1}
+# r_p_para  : realised OOS returns of the portfolio
+# W_tan_para: rolling weights (no-lookahead, James-Stein + rolling cov)
+returns_oos <- tail(returns, 250)
+n_fc_dcc  <- length(dcc_cov_forecast)
+mu_dcc    <- numeric(n_fc_dcc)
+sigma_dcc <- numeric(n_fc_dcc)
+
+for (t in 1:n_fc_dcc) {
+  # Weight from Parametric (no-lookahead) — SAME portfolio for all models
+  w_t          <- W_tan[t, ]
+  # DCC 1-step-ahead covariance forecast (made at t-1)
+  Sigma_t      <- dcc_cov_forecast[[t]][,, 1]
+  # James-Stein mean from Parametric rolling window (already in mu_para_roll)
+  mu_dcc[t]    <- mu_para_roll[t]
+  # Portfolio sigma from DCC covariance + shared weights
+  sigma_dcc[t] <- sqrt(as.numeric(t(w_t) %*% Sigma_t %*% w_t))
+}
+```
+
+
+```{r var_dcc 2}
+# Shared portfolio return — same r_p_para used for all models
+dcc_results <- backtest_multi_alpha(r_p_para, mu_dcc, sigma_dcc, alphas, "DCC-GARCH", df_t)
+
+kable(dcc_results, caption = "DCC-GARCH VaR/ES Backtest") %>%
+  fmt_kable()
+```
+
+# 21. GO-GARCH — VaR & ES (alpha = 1%, 2.5%, 5%)
+
+```{r var_go 1}
+n_fc_go  <- length(go_cov_forecast)
+mu_go    <- numeric(n_fc_go)
+sigma_go <- numeric(n_fc_go)
+
+for (t in 1:n_fc_go) {
+  w_t         <- W_tan[t, ]
+  Sigma_t     <- go_cov_forecast[[t]][,, 1]
+  mu_go[t]    <- mu_para_roll[t]
+  sigma_go[t] <- sqrt(as.numeric(t(w_t) %*% Sigma_t %*% w_t))
+}
+```
+
+
+```{r var_go 2}
+# Shared portfolio return
+go_results <- backtest_multi_alpha(r_p_para, mu_go, sigma_go, alphas, "GO-GARCH", df_t)
+
+kable(go_results, caption = "GO-GARCH VaR/ES Backtest") %>%
+  fmt_kable()
+```
+
+# 22. Historical Simulation — VaR & ES
+
+```{r var_hs}
+window_hs <- 250
+
+hs_results <- do.call(rbind, lapply(alphas, function(a) {
+  VaR_hs <- numeric(n_out)
+  ES_hs  <- numeric(n_out)
+
+  for (t in 1:n_out) {
+    day_OOS     <- start_out + t - 1
+    idx_end     <- day_OOS - 1
+    idx_start   <- idx_end - window_hs + 1
+    # Shared portfolio weights — same W_tan
+    w_t         <- W_tan[t, ]
+    port_window <- as.numeric(returns[idx_start:idx_end, ] %*% w_t)
+
+    VaR_hs[t] <- quantile(port_window, probs = a, type = 7)
+    below      <- port_window[port_window <= VaR_hs[t]]
+    ES_hs[t]  <- if (length(below) > 0) mean(below) else VaR_hs[t]
+  }
+  # r_p_para is the shared portfolio return — consistent with other models
+  run_backtest(r_p_para, VaR_hs, ES_hs, a, "Historical Simulation", "Empirical")
+}))
+
+kable(hs_results, caption = "Historical Simulation Backtest") %>%
+  fmt_kable()
+```
+
+# 23. Summary backtest table (by alpha)
+
+```{r summary_table, results='asis'}
+all_results <- rbind(dcc_results, go_results, para_results, hs_results)
+
+flag <- function(p) ifelse(is.na(p), "N/A", ifelse(p >= 0.05, "Pass", "Fail"))
+all_results$UC_flag <- flag(all_results$UC_pval)
+all_results$CC_flag <- flag(all_results$CC_pval)
+all_results$DQ_flag <- flag(all_results$DQ_pval)
+all_results$ES_flag <- flag(all_results$ES_pval)
+
+for (a in alphas) {
+  sub     <- all_results[all_results$Alpha == a, ]
+  display <- sub[, c("Model","Dist","Mean_VaR","Mean_ES","N_Violation","Exc_Rate",
+                      "UC_pval","UC_flag","CC_pval","CC_flag",
+                      "DQ_pval","DQ_flag","ES_pval","ES_flag","FZ_Score")]
+  colnames(display) <- c("Model","Dist","Mean VaR","Mean ES","Violations","Exc Rate",
+                          "p-UC","UC","p-CC","CC","p-DQ","DQ","p-ES","ES","FZ Score")
+  tbl <- kable(display, digits = 6,
+               caption = sprintf("Backtest Summary — Alpha = %.1f%%", a * 100))
+  print(fmt_kable(tbl))
+  cat("\n\n")
+}
+```
+
+# 24. FZ Score & Violation rate plots
+
+```{r fz_violation_plot, fig.width=13, fig.height=5}
+all_results$Label       <- paste(all_results$Model, all_results$Dist, sep = "\n")
+all_results$Alpha_label <- paste0("alpha = ", all_results$Alpha * 100, "%")
+
+p1 <- ggplot(all_results, aes(x = Label, y = FZ_Score, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Alpha_label, scales = "free_y") +
+  labs(title = "FZ Joint Loss Score (lower = better) — Tangency Portfolio",
+       x = NULL, y = "FZ Score") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+        plot.title  = element_text(face = "bold", hjust = 0.5),
+        strip.text  = element_text(face = "bold")) +
+  scale_fill_brewer(palette = "Set2")
+print(p1)
+
+alpha_ref <- data.frame(Alpha_label = paste0("alpha = ", alphas * 100, "%"), Alpha = alphas)
+p2 <- ggplot(all_results, aes(x = Label, y = Exc_Rate, color = Model)) +
+  geom_point(size = 3, show.legend = FALSE) +
+  geom_hline(data = alpha_ref, aes(yintercept = Alpha),
+             linetype = "dashed", color = "red", linewidth = 0.8) +
+  facet_wrap(~ Alpha_label, scales = "free_y") +
+  labs(title = "Actual Violation Rate vs Theoretical Alpha (red dashed)",
+       x = NULL, y = "Violation Rate") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+        plot.title  = element_text(face = "bold", hjust = 0.5),
+        strip.text  = element_text(face = "bold"))
+print(p2)
+```
+
+# 25. VaR/ES Ranking (averaged over all alpha levels)
+
+```{r ranking_table}
+ranking_var <- all_results %>%
+  group_by(Model, Dist) %>%
+  summarise(
+    FZ_Mean      = round(mean(FZ_Score, na.rm = TRUE), 8),
+    ExcRate_Mean = round(mean(Exc_Rate, na.rm = TRUE), 4),
+    UC_Pass_pct  = round(mean(UC_pval >= 0.05, na.rm = TRUE) * 100, 1),
+    CC_Pass_pct  = round(mean(CC_pval >= 0.05, na.rm = TRUE) * 100, 1),
+    DQ_Pass_pct  = round(mean(DQ_pval >= 0.05, na.rm = TRUE) * 100, 1),
+    ES_Pass_pct  = round(mean(ES_pval >= 0.05, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(FZ_Mean)
+
+colnames(ranking_var) <- c("Model","Dist","FZ Mean","Exc Rate Mean",
+                             "% Pass UC","% Pass CC","% Pass DQ","% Pass ES")
+kable(ranking_var, caption = "VaR/ES Ranking — Averaged over all alpha levels") %>%
+  fmt_kable()
+```
+
+# 26. Diebold-Mariano test for FZ loss differences
+Tests whether the difference in FZ scores between model pairs is statistically significant (H0: equal predictive accuracy).
+
+```{r}
+dm_alpha <- 0.01
+df_stress <- 5
+
+get_fz_series <- function(actual, VaR, ES, alpha) FZ(actual, VaR, ES, alpha)
+
+make_var_es_both <- function(mu_vec, sigma_vec, alpha, df_t = df_stress) {
+  res <- compute_var_es_param(mu_vec, sigma_vec, alpha, df_t)
+  list(
+    VaR_N = res$VaR_N, ES_N = res$ES_N,
+    VaR_T = res$VaR_T, ES_T = res$ES_T
+  )
+}
+
+res_dcc <- make_var_es_both(mu_dcc,  sigma_dcc, dm_alpha)
+res_go  <- make_var_es_both(mu_go,   sigma_go,  dm_alpha) 
+res_para <- make_var_es_both(mu_para_roll, sigma_para_roll, dm_alpha)
+
+VaR_hs <- numeric(n_out)
+ES_hs  <- numeric(n_out)
+
+for (t in 1:n_out) {
+  day_OOS        <- start_out + t - 1
+  idx_end        <- day_OOS - 1
+  idx_start      <- idx_end - 250 + 1
+  w_t            <- W_tan[t, ]
+  port_w         <- as.numeric(returns[idx_start:idx_end, ] %*% w_t)
+  VaR_hs[t]     <- quantile(port_w, probs = dm_alpha, type = 7)
+  ES_hs[t]      <- mean(port_w[port_w <= VaR_hs[t]])
+}
+
+# FZ loss series — Normal distribution
+fz_dcc_N  <- get_fz_series(r_p_para, res_dcc$VaR_N,  res_dcc$ES_N,  dm_alpha)
+fz_go_N   <- get_fz_series(r_p_para, res_go$VaR_N,   res_go$ES_N,   dm_alpha)
+fz_para_N <- get_fz_series(r_p_para, res_para$VaR_N, res_para$ES_N, dm_alpha)
+
+# FZ loss series — Student-t df=5 
+fz_dcc_T  <- get_fz_series(r_p_para, res_dcc$VaR_T,  res_dcc$ES_T,  dm_alpha)
+fz_go_T   <- get_fz_series(r_p_para, res_go$VaR_T,   res_go$ES_T,   dm_alpha)
+fz_para_T <- get_fz_series(r_p_para, res_para$VaR_T, res_para$ES_T, dm_alpha)
+
+# HAC-robust DM test (Newey-West, automatic bandwidth)
+dm_hac <- function(loss1, loss2, label1, label2) {
+  d      <- loss1 - loss2
+  T_     <- length(d)
+  lag_nw <- floor(T_^(1/3))
+  lm_d   <- lm(d ~ 1)
+  V_hac  <- sandwich::NeweyWest(lm_d, lag = lag_nw, prewhite = FALSE)
+  stat   <- mean(d) / sqrt(V_hac[1, 1] / T_)
+  pval   <- 2 * pnorm(-abs(stat))
+  data.frame(
+    Model_1   = label1,
+    Model_2   = label2,
+    Mean_diff = round(mean(d), 8),
+    DM_stat   = round(stat, 4),
+    p_value   = round(pval, 4),
+    Result    = ifelse(pval < 0.01,
+                       ifelse(mean(d) < 0,
+                              paste(label1, "better"),
+                              paste(label2, "better")),
+                       "No significant difference"),
+    stringsAsFactors = FALSE
+  )
+}
+
+dm_normal <- rbind(
+  dm_hac(fz_dcc_N,  fz_go_N,   "DCC-GARCH",  "GO-GARCH"),
+  dm_hac(fz_dcc_N,  fz_para_N, "DCC-GARCH",  "Parametric"),
+  dm_hac(fz_go_N,   fz_para_N, "GO-GARCH",   "Parametric")
+)
+
+dm_t5 <- rbind(
+  dm_hac(fz_dcc_T,  fz_go_T,   "DCC-GARCH",  "GO-GARCH"),
+  dm_hac(fz_dcc_T,  fz_para_T, "DCC-GARCH",  "Parametric"),
+  dm_hac(fz_go_T,   fz_para_T, "GO-GARCH",   "Parametric")
+)
+
+kable(dm_normal,
+      caption = "Diebold-Mariano Test (HAC-robust) — FZ Loss at alpha=1%, Normal Distribution") %>%
+  fmt_kable(note = "H0: equal predictive accuracy. Positive Mean_diff => Model_1 has higher FZ loss (worse).")
+
+kable(dm_t5,
+      caption = "Diebold-Mariano Test (HAC-robust) — FZ Loss at alpha=1%, Student-t Distribution (df=5)") %>%
+  fmt_kable(note = "H0: equal predictive accuracy. Positive Mean_diff => Model_1 has higher FZ loss (worse). Student-t df=5: heavier tails than Normal — more conservative VaR/ES.")
+```
+
+# 27. Portfolio performance analysis
+## 27.1. Cumulative returns (OOS)
+
+```{r perf_cumreturn}
+ggplot(data.frame(t = 1:250, CumReturn = cumsum(r_p_para)), aes(x = t, y = CumReturn)) +
+  geom_line(linewidth = 1, color = "#2196F3") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title    = "Cumulative Log-Return — Tangency Portfolio (OOS 250 days)",
+       subtitle = "Single portfolio used across all VaR estimation methods",
+       x = "OOS Day", y = "Cumulative Log-Return") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+## 27.2. Performance metrics table
+
+```{r perf_metrics 1}
+calc_performance <- function(r, label, rf = rf_oos_mean, ann = 252) {
+  r        <- na.omit(r)
+  excess_r <- r - rf
+  mu_d     <- mean(r)
+  sd_d     <- sd(r)
+  mu_ann   <- mu_d * ann
+  sd_ann   <- sd_d * sqrt(ann)
+  sharpe   <- mean(excess_r) / sd_d * sqrt(ann)
+
+  # Sortino: downside deviation below rf
+  downside <- r[r < rf]
+  dd_ann   <- if (length(downside) > 1) sd(downside) * sqrt(ann) else NA_real_
+  sortino  <- (mu_ann - rf * ann) / dd_ann
+
+  # Max drawdown
+  cum_r  <- cumsum(r)
+  peak   <- cummax(cum_r)
+  max_dd <- min(cum_r - peak)
+  calmar <- if (abs(max_dd) > 0) mu_ann / abs(max_dd) else NA_real_
+
+  # Win/loss
+  win_rate <- mean(r > 0) * 100
+  avg_gain <- mean(r[r > 0])
+  avg_loss <- mean(r[r < 0])
+  gl_ratio <- abs(avg_gain / avg_loss)
+
+  data.frame(
+    Portfolio       = label,
+    Total_Return    = round(sum(r), 6),
+    Ann_Return      = round(mu_ann, 6),
+    Ann_Volatility  = round(sd_ann, 6),
+    Sharpe          = round(sharpe, 4),
+    Sortino         = round(sortino, 4),
+    Max_Drawdown    = round(max_dd, 6),
+    Calmar          = round(calmar, 4),
+    Win_Rate_pct    = round(win_rate, 2),
+    GL_Ratio        = round(gl_ratio, 4),
+    VaR_1pct_emp    = round(quantile(r, 0.01), 6),
+    VaR_5pct_emp    = round(quantile(r, 0.05), 6),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r perf_metrics 2}
+perf_table <- calc_performance(r_p_para, "Tangency Portfolio")
+
+perf_t        <- as.data.frame(t(perf_table[, -1]))
+colnames(perf_t) <- perf_table$Portfolio
+perf_t$Metric <- rownames(perf_t)
+perf_t        <- perf_t[, c("Metric", "Tangency Portfolio")]
+```
+
+```{r perf_metrics 3}
+kable(perf_t, row.names = FALSE,
+      caption = "Performance Metrics — Tangency Portfolio (250-day OOS)") %>%
+  fmt_kable(note = paste0(
+    "Ann_Return & Ann_Volatility: annualised (x252). ",
+    "Max_Drawdown: based on cumulative log-return. ",
+    "rf_oos_mean (daily) = ", round(rf_oos_mean, 8),
+    " (ann. ", round(rf_oos_mean*252*100, 4), "%). Source: FRED DTB3."))
+```
+
+## 27.3. Return distribution
+
+```{r perf_dist}
+ggplot(data.frame(Return = r_p_para), aes(x = Return)) +
+  geom_density(fill = "#2196F3", color = "#1565C0", alpha = 0.3, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = mean(r_p_para), linetype = "solid", color = "#1565C0", linewidth = 0.8) +
+  labs(title    = "Daily Return Distribution — Tangency Portfolio",
+       subtitle = "Blue vertical line = mean return",
+       x = "Log-Return", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+# 28. Backtesting report
+Basel III requires VaR backtesting over a 250 trading-day window at the 99% confidence level (alpha = 1%) on a 1-day horizon.
+The number of exceptions (actual loss > VaR) determines the regulatory capital multiplier via the Traffic Light framework:
+
+```{r basel_traffic_light}
+# Traffic Light classification per model & distribution
+# Basel reference: alpha = 1%, 250-day OOS window
+traffic_light <- function(n_exceptions, T_oos = 250) {
+  p_vals <- sapply(0:n_exceptions, function(k)
+    dbinom(k, T_oos, prob = 0.01))
+  cum_p  <- sum(p_vals)   # P(X <= n_exceptions | p=0.01)
+
+  zone   <- dplyr::case_when(
+    n_exceptions <= 4  ~ "Green",
+    n_exceptions <= 9  ~ "Yellow",
+    TRUE               ~ "Red"
+  )
+  add_on <- dplyr::case_when(
+    n_exceptions == 0  ~ 0.00,
+    n_exceptions == 1  ~ 0.00,
+    n_exceptions == 2  ~ 0.00,
+    n_exceptions == 3  ~ 0.00,
+    n_exceptions == 4  ~ 0.00,
+    n_exceptions == 5  ~ 0.40,
+    n_exceptions == 6  ~ 0.50,
+    n_exceptions == 7  ~ 0.65,
+    n_exceptions == 8  ~ 0.75,
+    n_exceptions == 9  ~ 0.85,
+    TRUE               ~ 1.00
+  )
+  data.frame(
+    Exceptions     = n_exceptions,
+    Zone           = zone,
+    CumProb        = round(cum_p, 4),
+    Multiplier_k   = round(3 + add_on, 2),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Apply to all models at alpha = 1%
+bt_1pct <- all_results[all_results$Alpha == 0.01, ]
+
+basel_tbl <- do.call(rbind, lapply(1:nrow(bt_1pct), function(i) {
+  row  <- bt_1pct[i, ]
+  tl   <- traffic_light(row$N_Violation)
+  data.frame(
+    Model        = row$Model,
+    Dist         = row$Dist,
+    Exceptions   = tl$Exceptions,
+    Exc_Rate     = row$Exc_Rate,
+    Zone         = tl$Zone,
+    CumProb      = tl$CumProb,
+    k_multiplier = tl$Multiplier_k,
+    UC_pval      = row$UC_pval,
+    CC_pval      = row$CC_pval,
+    DQ_pval      = row$DQ_pval,
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Colour-code zones
+zone_colors <- ifelse(basel_tbl$Zone == "Green",  "#C8E6C9",
+               ifelse(basel_tbl$Zone == "Yellow", "#FFF9C4", "#FFCDD2"))
+
+kable(basel_tbl,
+      caption = "Basel III Traffic Light Backtesting Report — alpha = 1%, T = 250 days") %>%
+  fmt_kable(note = paste0(
+    "Green zone: 0-4 exceptions (k=3.00). ",
+    "Yellow zone: 5-9 exceptions (k=3.40 to 3.85). ",
+    "Red zone: 10+ exceptions (k=4.00). ",
+    "CumProb = P(X <= exceptions | p=0.01, T=250). ",
+    "Higher k = higher regulatory capital charge."))
+```
+
+```{r}
+# Daily exceptions timeline — shows WHEN violations occur
+# Clustering of violations is a warning sign (CC test failure)
+res_dcc_1  <- compute_var_es_param(mu_para_roll, sigma_dcc,        0.01, df_t)
+res_go_1   <- compute_var_es_param(mu_para_roll, sigma_go,         0.01, df_t)
+res_para_1 <- compute_var_es_param(mu_para_roll, sigma_para_roll,  0.01, df_t)
+
+# Student-t VaR at df=5 for each parametric model
+# qt(0.01, df=5) replaces qnorm(0.01) in VaR computation
+df_stress <- 5
+t_scalar  <- qt(0.01, df = df_stress) / qnorm(0.01)  # scaling factor vs Normal
+
+VaR_t5_dcc  <- mu_para_roll + qt(0.01, df = df_stress) * sigma_dcc
+VaR_t5_go   <- mu_para_roll + qt(0.01, df = df_stress) * sigma_go
+VaR_t5_para <- mu_para_roll + qt(0.01, df = df_stress) * sigma_para_roll
+
+# Reusable exception timeline function
+# mode: "Normal" or "Student-t (df=5)" — controls label & color
+plot_exc_timeline <- function(actual, VaR, label, mode = "Normal") {
+
+  line_color <- if (mode == "Normal") "#1565C0" else "#6A1B9A"
+  line_label <- if (mode == "Normal") "Normal VaR (1%)" else "Student-t VaR (1%, df=5)"
+
+  df <- data.frame(
+    t         = seq_along(actual),
+    Return    = actual,
+    VaR       = VaR,
+    violation = actual < VaR
+  )
+
+  ggplot(df, aes(x = t)) +
+    geom_bar(aes(y = Return), stat = "identity",
+             fill = "#B0BEC5", alpha = 0.6, width = 0.8) +
+    geom_bar(data = df[df$violation, ], aes(y = Return),
+             stat = "identity", fill = "#E53935", alpha = 0.9, width = 0.8) +
+    geom_line(aes(y = VaR, color = line_label), linewidth = 0.9) +
+    geom_point(data = df[df$violation, ],
+               aes(x = t, y = Return),
+               color = "#B71C1C", size = 2.5, shape = 18) +
+    geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+    scale_color_manual(values = setNames(line_color, line_label)) +
+    labs(
+      title    = sprintf("Exception Timeline — %s (alpha=1%%, %s)", label, mode),
+      subtitle = sprintf(
+        "Grey bars = actual returns | Red bars = violations (n=%d)",
+        sum(df$violation)
+      ),
+      x = "OOS Day", y = "Daily Log-Return / VaR", color = NULL
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title    = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+      legend.position = "top"
+    )
+}
+
+# HS VaR at alpha=1%
+VaR_hs_1pct <- numeric(n_out)
+for (t in 1:n_out) {
+  day_OOS        <- start_out + t - 1
+  idx_end        <- day_OOS - 1
+  idx_start      <- idx_end - 250 + 1
+  w_t            <- W_tan[t, ]
+  port_w         <- as.numeric(returns[idx_start:idx_end, ] %*% w_t)
+  VaR_hs_1pct[t] <- quantile(port_w, probs = 0.01, type = 7)
+}
+
+# Plot — Normal VaR (4 models)
+print(plot_exc_timeline(r_p_para, res_dcc_1$VaR_N,  "DCC-GARCH",     "Normal"))
+print(plot_exc_timeline(r_p_para, res_go_1$VaR_N,   "GO-GARCH",      "Normal"))
+print(plot_exc_timeline(r_p_para, res_para_1$VaR_N, "Parametric",    "Normal"))
+print(plot_exc_timeline(r_p_para, VaR_hs_1pct,      "Historical Simulation"))
+
+
+# Plot — Student-t VaR df=5 (3 parametric models)
+print(plot_exc_timeline(r_p_para, VaR_t5_dcc,  "DCC-GARCH",  "Student-t (df=5)"))
+print(plot_exc_timeline(r_p_para, VaR_t5_go,   "GO-GARCH",   "Student-t (df=5)"))
+print(plot_exc_timeline(r_p_para, VaR_t5_para, "Parametric", "Student-t (df=5)"))
+```
+
+
+
