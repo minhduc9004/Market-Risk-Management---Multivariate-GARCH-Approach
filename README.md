@@ -253,7 +253,7 @@ Under the **Fundamental Review of the Trading Book (FRTB, 2019)**:
 
 ---
 
-## 📚 References
+## References
 
 - Engle, R. F. (2002). Dynamic Conditional Correlation. *Journal of Business & Economic Statistics.*
 - Van der Weide, R. (2002). GO-GARCH: A Multivariate Generalized Orthogonal GARCH Model. *Journal of Applied Econometrics.*
