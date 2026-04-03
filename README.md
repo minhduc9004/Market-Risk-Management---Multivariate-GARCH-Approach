@@ -1,10 +1,10 @@
-# 📊 Market Risk Management | Multivariate GARCH & Backtesting
+# Market Risk Management | Multivariate GARCH & Backtesting
 
 > A comprehensive market risk management framework for a four-asset ETF portfolio (SPY, TLT, GLD, USO) covering volatility modeling, VaR/ES estimation, rigorous backtesting, and Basel III regulatory compliance assessment.
 
 ---
 
-## 📁 Dataset
+## Dataset
 
 - **Source:** Yahoo Finance (via `quantmod` / `yfinance`)
 - **Assets:** SPY (S&P 500), TLT (20yr Treasury), GLD (Gold), USO (Crude Oil)
@@ -15,7 +15,7 @@
 
 ---
 
-## 🎯 Objectives
+## Objectives
 
 1. Model conditional volatility and dynamic correlations across asset classes
 2. Estimate and backtest Value-at-Risk (VaR) and Expected Shortfall (ES)
@@ -24,7 +24,7 @@
 
 ---
 
-## 📐 Key Mathematical Concepts
+## Key Mathematical Concepts
 
 ### 1. Value-at-Risk (VaR)
 
@@ -81,7 +81,7 @@ In this project, weights are rebalanced **daily** using one-step-ahead covarianc
 
 ---
 
-## 📊 Performance Metrics
+## Performance Metrics
 
 ### Sharpe Ratio
 Measures risk-adjusted return relative to a risk-free benchmark:
@@ -142,7 +142,7 @@ $$\text{Calmar} = \frac{R_p^{\text{ann}}}{|MDD|}$$
 
 ---
 
-## 🧪 VaR Backtesting Framework
+## VaR Backtesting Framework
 
 ### Statistical Tests
 
@@ -201,9 +201,9 @@ Under **Basel III / FRTB**, banks must backtest their internal VaR models daily 
 
 | Zone | Exceptions | Capital Multiplier k | Implication |
 |------|-----------|----------------------|-------------|
-| 🟢 Green | 0 – 4 | 3.00 | Minimum capital requirement |
-| 🟡 Yellow | 5 – 9 | 3.40 – 3.85 | Increased capital charge |
-| 🔴 Red | ≥ 10 | 4.00 | Mandatory model review |
+| Green | 0 – 4 | 3.00 | Minimum capital requirement |
+| Yellow | 5 – 9 | 3.40 – 3.85 | Increased capital charge |
+| Red | ≥ 10 | 4.00 | Mandatory model review |
 
 ### Regulatory Capital Formula
 
@@ -222,24 +222,11 @@ Under the **Fundamental Review of the Trading Book (FRTB, 2019)**:
 - VaR at 99% is replaced by **ES at 97.5%** as the primary internal risk measure
 - ES is preferred because it is a **coherent risk measure** (satisfies subadditivity) and captures the full shape of the tail beyond the threshold
 - Banks must also demonstrate **P&L attribution** and pass both VaR and ES backtests
-
-### Backtesting Results Summary (α = 1%, 250-day OOS)
-
-| Model | Distribution | Exceptions | Zone | k | UC | CC | DQ | ES |
-|-------|-------------|-----------|------|---|----|----|----|----|
-| DCC-GARCH | Student-t | 3 | 🟢 Green | 3.00 | ✅ | ✅ | ✅ | ✅ |
-| GO-GARCH | Student-t | 3 | 🟢 Green | 3.00 | ✅ | ✅ | ✅ | ✅ |
-| Parametric | Student-t | 3 | 🟢 Green | 3.00 | ✅ | ✅ | ✅ | ✅ |
-| Historical Sim | Empirical | 4 | 🟢 Green | 3.00 | ✅ | ✅ | ❌ | ✅ |
-| DCC-GARCH | Normal | 4 | 🟢 Green | 3.00 | ✅ | ✅ | ❌ | ❌ |
-| GO-GARCH | Normal | 6 | 🟡 Yellow | 3.50 | ✅ | ✅ | ❌ | ❌ |
-| Parametric | Normal | 6 | 🟡 Yellow | 3.50 | ✅ | ❌ | ❌ | ❌ |
-
 > **Key finding:** Student-t specifications consistently achieve Green zone status. Normal distribution models underestimate tail risk, leading to Yellow zone classification and 17% higher capital requirements.
 
 ---
 
-## 🏆 Model Recommendation
+## Model Recommendation
 
 | Dimension | Champion Model |
 |-----------|---------------|
@@ -251,7 +238,7 @@ Under the **Fundamental Review of the Trading Book (FRTB, 2019)**:
 
 ---
 
-## 🛠️ Tools & Libraries
+## Tools & Libraries
 
 | Category | Tools |
 |----------|-------|
@@ -263,25 +250,6 @@ Under the **Fundamental Review of the Trading Book (FRTB, 2019)**:
 | Visualization | `ggplot2`, `gridExtra` |
 
 ---
-
-## 📂 Project Structure
-
-```
-market-risk-garch/
-├── data/
-│   └── etf_prices.csv
-├── scripts/
-│   ├── 01_data_preparation.R
-│   ├── 02_univariate_garch.R
-│   ├── 03_dcc_garch.R
-│   ├── 04_go_garch.R
-│   ├── 05_var_es_backtest.R
-│   ├── 06_basel3_report.R
-│   └── 07_portfolio_performance.R
-├── output/
-│   └── Market_Risk_Report.pdf
-└── README.md
-```
 
 ---
 
